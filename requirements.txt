@@ -12,8 +12,10 @@ torch-fidelity==0.3.0
 transformers==4.19.2
 torchmetrics==0.6.0
 kornia==0.6
+msgpack==1.0.4
+fpng-py==0.0.3
 -e git+https://github.com/CompVis/taming-transformers.git@master#egg=taming-transformers
 -e git+https://github.com/openai/CLIP.git@main#egg=clip
-msgpack==1.0.4
-qoi==0.2.0
+-e git+https://github.com/hlky/k-diffusion-sd#egg=k_diffusion
+#qoi==0.2.0
 #    - -e .

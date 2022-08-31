@@ -51,7 +51,7 @@ parser.add_argument(
 parser.add_argument(
     "--ddim_steps",
     type=int,
-    default=84,
+    default=50,
     help="number of ddim sampling steps",
 )
 
@@ -76,7 +76,7 @@ parser.add_argument(
 parser.add_argument(
     "--n_samples",
     type=int,
-    default=9,
+    default=1,
     help="how many samples to produce for each given prompt. A.k.a. batch size",
 )
 parser.add_argument(
@@ -151,156 +151,57 @@ def move_to_cpu(tensor):
         time.sleep(1)
 
 serv = Server()
-
-def start_serv():
-    print("Started server thread")
-    asyncio.run(serv.run())
-
-serv_thread = Thread(target=start_serv)
-serv_thread.start()
-
-#batches = []
-# input_data = msgpack.packb({
-#     'ty': 'request',
-#     'request': {
-#         'id': 0,
-#         'prompt': opt.prompt,
-#         'w': opt.W,
-#         'h': opt.H,
-#         'seed': opt.seed, 'count': opt.n_samples * opt.n_iter, 'scale': opt.scale, 'steps': opt.ddim_steps
-#     }
-# })
-
-# serv.feed(input_data)
-
-    #batch = []
-    #for j in range(batch_size):
-    #    batch.append({ 'prompt': opt.prompt, 'seed': (opt.seed + i * batch_size + j) & 0x7fffffff })
-    #batches.append(batch)
-
+serv.start()
 
 precision_scope = autocast if opt.precision=="autocast" else nullcontext
 try:
     with torch.no_grad():
 
         while serv.wait_for_requests(): # len(serv.buckets) > 0:
-            time.sleep(1) # Allow any straggling requests to arrive
             batch = serv.batch_requests(batch_size)
             with precision_scope("cuda"):
                 modelCS.to(device)
                 uc = None
-                if batch[0]['scale'] != 1.0:
+                if serv.scale_for_batch(batch) != 1.0:
                     uc = modelCS.get_learned_conditioning(len(batch) * [""]) # Cache
-                prompts = [job['prompt'] for job in batch]
+                prompts = serv.prompts_for_batch(batch)
                 
                 c = modelCS.get_learned_conditioning(prompts)
-                #shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
-                shape = [opt.C, batch[0]['h'] // opt.f, batch[0]['w'] // opt.f]
+                shape = serv.shape_for_batch(batch)
                 move_to_cpu(modelCS)
 
-                start_codes = []
-                for job in batch:
-                    generator = torch.Generator()
-                    generator.manual_seed(job['seed'])
-                    #start_codes.append(torch.randn([opt.C, opt.H // opt.f, opt.W // opt.f], generator=generator))
-                    start_codes.append(torch.randn([opt.C, job['h'] // opt.f, job['w'] // opt.f], generator=generator))
-                start_code = torch.stack(start_codes, 0).to(device)
-
-                def preview_img(img, pred_x0, stepi):
-                    if stepi > 0 and (stepi % 10) == 0:
-                        for i in range(len(batch)):
-                            job = batch[i]
-                            x_samples_ddim = modelFS.decode_first_stage(img[i].unsqueeze(0))
-                            x_sample = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
-                            x_sample = 255. * rearrange(x_sample[0].cpu().numpy(), 'c h w -> h w c')
-                            qoi_bytes = qoi.encode(x_sample.astype(np.uint8, order='C'))
-
-                            serv.send_response({
-                                'ty': 'result',
-                                'result': {
-                                    'id': job['id'],
-                                    'index': job['index'],
-                                    'seed': job['seed'],
-                                    'scale': job['scale'],
-                                    'steps': job['steps'],
-                                    'image': qoi_bytes
-                                }
-                            }, job['client'])
-
+                start_code = serv.startcodes_for_batch(batch).to(device)
 
                 # x0 = original image
                 # x_T = seed noise
-                # img_callback(img, pred_x0, i) for each step
-                samples_ddim = model.sample(S=opt.ddim_steps,
+                # img_callback(pred_x0, i) for each step
+                samples_ddim = model.sample(S=serv.steps_for_batch(batch),
                                 conditioning=c,
                                 batch_size=len(batch),
                                 shape=shape,
                                 verbose=False,
-                                unconditional_guidance_scale=batch[0]['scale'],
+                                unconditional_guidance_scale=serv.scale_for_batch(batch),
                                 unconditional_conditioning=uc,
                                 eta=opt.ddim_eta,
+                                seed=None,
                                 #img_callback=preview_img,
                                 x_T=start_code)
 
                 modelFS.to(device)
                 print("saving images")
 
-                counts_in_dirs = {}
                 for i in range(len(batch)):
                     job = batch[i]
                     x_samples_ddim = modelFS.decode_first_stage(samples_ddim[i].unsqueeze(0))
                     x_sample = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
-                # for x_sample in x_samples_ddim:
+
                     x_sample = 255. * rearrange(x_sample[0].cpu().numpy(), 'c h w -> h w c')
 
-                    hashkey = json.dumps({ 'prompt': job['prompt'] })
-                    hash = hashlib.sha1(hashkey.encode('utf8')).hexdigest()
-                    dirname = re.sub(r"[^A-Za-z0-9,]", lambda _: "_", job['prompt'])[:140] + hash
+                    image = x_sample.astype(np.uint8, order='C')
 
-                    sample_path = os.path.join(outpath, "samples", dirname)
+                    image_bytes = serv.save_image(job, image, outpath)
+                    serv.send_response(job, image_bytes)
 
-                    if not os.path.isdir(sample_path):
-                        os.makedirs(sample_path, exist_ok=True)
-
-                        with open(os.path.join(sample_path, 'options.txt'), 'a') as f:
-                            json.dump({ 'prompt': job['prompt']}, f)
-
-                    if sample_path not in counts_in_dirs:
-                        counts_in_dirs[sample_path] = len(os.listdir(sample_path)) - 1
-
-                    start_time = time.time()
-                    qoi_bytes = qoi.encode(x_sample.astype(np.uint8, order='C'))
-                    end_time = time.time()
-                    qoi_size = len(qoi_bytes)
-                    print(f"qoi: {end_time - start_time}, size: {qoi_size}")
-
-                    start_time = time.time()
-                    with io.BytesIO() as mem:
-                        Image.fromarray(x_sample.astype(np.uint8)).save(mem, format="png")
-                        end_time = time.time()
-
-                        with mem.getbuffer() as buffer:
-
-                            print(f"png: {end_time - start_time}, size: {len(buffer)}")
-                            with open(os.path.join(sample_path, f"{counts_in_dirs[sample_path]:05}_{job['seed']}_{job['scale']}_{job['steps']}.png"), 'wb') as f:
-                                f.write(buffer)
-
-                    serv.send_response({
-                        'ty': 'result',
-                        'result': {
-                            'id': job['id'],
-                            'index': job['index'],
-                            'seed': job['seed'],
-                            'scale': job['scale'],
-                            'steps': job['steps'],
-                            'image': qoi_bytes
-                        }
-                    }, job['client'])
-
-                    #Image.fromarray(x_sample.astype(np.uint8)).save(
-                    #    os.path.join(sample_path, f"{counts_in_dirs[sample_path]:05}_{batch[i]['seed']}.png"))
-
-                    counts_in_dirs[sample_path] += 1
 
                 move_to_cpu(modelFS)
 

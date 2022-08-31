@@ -346,6 +346,7 @@ class UNet(DDPM):
             conditioning_key = 'concat' if concat_mode else 'crossattn'
         ckpt_path = kwargs.pop("ckpt_path", None)
         ignore_keys = kwargs.pop("ignore_keys", [])
+        print(f'UNet is {kwargs}')
         super().__init__(conditioning_key=conditioning_key, *args, **kwargs)
         self.concat_mode = concat_mode
         self.cond_stage_trainable = cond_stage_trainable
@@ -397,6 +398,7 @@ class UNet(DDPM):
     def apply_model(self, x_noisy, t, cond, return_ids=False):
           
         self.model1.to("cuda")
+        self.model2.to("cuda") # TEMP
         step = 1
         if self.small_batch:
             step = 2
@@ -413,8 +415,8 @@ class UNet(DDPM):
             for j in range(lenhs):
                 hs[j] = torch.cat((hs[j], hs_temp[j]))
         
-        self.model1.to("cpu")
-        self.model2.to("cuda")
+        #self.model1.to("cpu") # TEMP
+        #self.model2.to("cuda") # TEMP
         
         hs_temp = [hs[j][:step] for j in range(lenhs)]
         x_recon = self.model2(h[:step],emb[:step],x_noisy.dtype,hs_temp,cond[:step])
@@ -425,7 +427,7 @@ class UNet(DDPM):
             x_recon1 = self.model2(h[i:i+step],emb[i:i+step],x_noisy.dtype,hs_temp,cond[i:i+step])
             x_recon = torch.cat((x_recon, x_recon1))
 
-        self.model2.to("cpu")
+        #self.model2.to("cpu") # TEMP
 
         if isinstance(x_recon, tuple) and not return_ids:
             return x_recon[0]
@@ -500,7 +502,7 @@ class UNet(DDPM):
                 if conditioning.shape[0] != batch_size:
                     print(f"Warning: Got {conditioning.shape[0]} conditionings but batch-size is {batch_size}")
 
-        # self.make_schedule(ddim_num_steps=S, ddim_eta=eta, verbose=verbose)
+        self.make_schedule(ddim_num_steps=S, ddim_eta=eta, verbose=verbose)
 
         # sampling
         C, H, W = shape

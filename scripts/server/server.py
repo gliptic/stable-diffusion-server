@@ -5,48 +5,31 @@ import time
 import random
 import io, os, json, re, hashlib
 import qoi
+import fpng_py
 from threading import Thread
 from PIL import Image
 from threading import Lock
 from contextlib import suppress
 
-class Bucket:
-    def __init__(self, key):
-        self.key = key
-        self.count = 0
-        self.requests = []
+def take_job_from_request(request, batch):
+    batch.append({
+        'id': request['id'],
+        'prompt': request["prompt"],
+        "seed": request["seed"],
+        'scale': request["scale"],
+        'steps': request["steps"],
+        'w': request["w"],
+        'h': request["h"],
+        'index': request['index'],
+        'client': request['client'],
+        'sampler': request['sampler'],
+    })
+    request["seed"] = (request["seed"] + 1) & 0x7fffffff
+    request["count"] -= 1
+    request['index'] += 1
 
-    def fill_batch(self, max_count, batch):
-        while self.count > 0 and len(batch) < max_count:
-            request = self.requests[0]
-            number_to_add = min(max_count - len(batch), request["count"])
-            print(f'Adding {number_to_add} requests from bucket')
-            for i in range(number_to_add):
-                batch.append({
-                    'id': request['id'],
-                    'prompt': request["prompt"],
-                    'seed': request["seed"],
-                    'scale': request["scale"],
-                    'steps': request["steps"],
-                    'w': request["w"],
-                    'h': request["h"],
-                    'index': request['index'],
-                    'client': request['client'],
-                })
-                request["seed"] = (request["seed"] + 1) & 0x7fffffff
-                request["count"] -= 1
-                request['index'] += 1
-
-            if request["count"] == 0:
-                del self.requests[0]
-            self.count -= number_to_add
-
-    def add_request(self, request):
-        request['index'] = 0
-        if request['seed'] < 0:
-            request['seed'] = random.randint(0, 0x7fffffff)
-        self.count += request['count']
-        self.requests.append(request)
+def key_for_request(request):
+    return f"{request['w']}_{request['h']}_{request['scale']}_{request['steps']}_{request['sampler']}"
 
 class Client:
     def __init__(self, socket, server):
@@ -103,8 +86,7 @@ class Event_ts(asyncio.Event):
 
 class Server:
     def __init__(self):
-        #self.unpacker = msgpack.Unpacker()
-        self.buckets = {}
+        self.queue = []
         self.bucket_mutex = Lock()
         self.counts_in_dirs = {}
 
@@ -115,13 +97,12 @@ class Server:
             self.add_request(request)
 
     def add_request(self, request):
-        bucket_key = f"{request['w']}_{request['h']}_{request['scale']}_{request['steps']}"
-        print(f'bucket key {bucket_key}')
+        request['index'] = 0
+        if request["seed"] < 0:
+            request["seed"] = random.randint(0, 0x7fffffff)
 
         with self.bucket_mutex:
-            if bucket_key not in self.buckets:
-                self.buckets[bucket_key] = Bucket(bucket_key)
-            self.buckets[bucket_key].add_request(request)
+            self.queue.append(request)
 
     def steps_for_batch(self, batch):
         return batch[0]['steps']
@@ -131,6 +112,9 @@ class Server:
 
     def prompts_for_batch(self, batch):
         return [job['prompt'] for job in batch]
+
+    def sampler_for_batch(self, batch):
+        return batch[0]['sampler']
 
     def shape_for_batch(self, batch):
         C = 4
@@ -143,9 +127,18 @@ class Server:
         start_codes = []
         for job in batch:
             generator = torch.Generator()
-            generator.manual_seed(job['seed'])
+            generator.manual_seed(job["seed"])
             start_codes.append(torch.randn([C, job['h'] // f, job['w'] // f], generator=generator))
         return torch.stack(start_codes, 0)
+
+    def encode_image(self, job, image):
+        start_time = time.time()
+        png_bytes = fpng_py.fpng_encode_image_to_memory(image.tobytes(), job['w'], job['h'], 3, fpng_py.CompressionFlags.FPNG_ENCODE_SLOWER)
+        end_time = time.time()
+        png_size = len(png_bytes)
+        print(f"fpng: {end_time - start_time}, size: {png_size}")
+
+        return png_bytes
 
     def save_image(self, job, image, outpath):
         hashkey = json.dumps({ 'prompt': job['prompt'] })
@@ -164,25 +157,18 @@ class Server:
             self.counts_in_dirs[sample_path] = len(os.listdir(sample_path)) - 1
 
         start_time = time.time()
-        qoi_bytes = qoi.encode(image)
+        png_bytes = fpng_py.fpng_encode_image_to_memory(image.tobytes(), job['w'], job['h'], 3, fpng_py.CompressionFlags.FPNG_ENCODE_SLOWER)
         end_time = time.time()
-        qoi_size = len(qoi_bytes)
-        print(f"qoi: {end_time - start_time}, size: {qoi_size}")
+        png_size = len(png_bytes)
+        print(f"fpng: {end_time - start_time}, size: {png_size}")
 
-        start_time = time.time()
-        with io.BytesIO() as mem:
-            Image.fromarray(image).save(mem, format="png")
-            end_time = time.time()
-
-            with mem.getbuffer() as buffer:
-
-                print(f"png: {end_time - start_time}, size: {len(buffer)}")
-                with open(os.path.join(sample_path, f"{self.counts_in_dirs[sample_path]:05}_{job['seed']}_{job['scale']}_{job['steps']}.png"), 'wb') as f:
-                    f.write(buffer)
+        sampler = job['sampler'].replace('_', '-')
+        with open(os.path.join(sample_path, f"{self.counts_in_dirs[sample_path]:05}_{job['seed']}_{job['scale']}_{job['steps']}_{sampler}.png"), 'wb') as f:
+            f.write(png_bytes)
 
         self.counts_in_dirs[sample_path] += 1
 
-        return qoi_bytes
+        return png_bytes
 
     def send_response(self, job, image_bytes):
         response = {
@@ -190,10 +176,11 @@ class Server:
             'result': {
                 'id': job['id'],
                 'index': job['index'],
-                'seed': job['seed'],
+                "seed": job["seed"],
                 'scale': job['scale'],
                 'steps': job['steps'],
                 'prompt': job['prompt'],
+                'sampler': job['sampler'],
                 'image': image_bytes
             }
         }
@@ -204,18 +191,30 @@ class Server:
     def batch_requests(self, max_count):
         batch = []
         with self.bucket_mutex:
-            bucket = max(self.buckets.values(), key=lambda x: x.count)
-            bucket.fill_batch(max_count, batch)
-            if bucket.count == 0:
-                del self.buckets[bucket.key]
-            return batch
+            if len(self.queue) > 0:
+                index = 0
+                batch_key = key_for_request(self.queue[0])
+
+                while index < len(self.queue) and len(batch) < max_count:
+                    request = self.queue[index]
+                    if batch_key == key_for_request(request):
+                        take_job_from_request(request, batch)
+
+                        # Delete or move last
+                        del self.queue[index]
+                        if request['count'] > 0:
+                            self.queue.append(request)
+                    else:
+                        index += 1
+
+        return batch
 
     def wait_for_requests(self):
         print('Wait for requests')
         while True:
             with self.bucket_mutex:
-                if len(self.buckets) > 0:
-                    time.sleep(1) # Allow any straggling requests to arrive
+                if len(self.queue) > 0:
+                    time.sleep(0.2) # Allow any straggling requests to arrive
                     return True
             time.sleep(0.1)
 
@@ -228,24 +227,25 @@ class Server:
         serv_thread.start()
 
     def stop(self):
-        self.stop_event.set()
+        pass
+        #self.stop_event.set()
 
-    async def wait_for_stop(self):
-        await self.stop_event.wait()
+    # async def wait_for_stop(self):
+    #     await self.stop_event.wait()
 
-        print('Stop event triggered')
+    #     print('Stop event triggered')
 
-        loop = asyncio.get_event_loop()
-        pending = asyncio.all_tasks()
-        for task in pending:
-            task.cancel()
-            # Now we should await task to execute it's cancellation.
-            # Cancelled task raises asyncio.CancelledError that we can suppress:
-            with suppress(asyncio.CancelledError):
-                loop.run_until_complete(task)
+    #     loop = asyncio.get_event_loop()
+    #     pending = asyncio.all_tasks()
+    #     for task in pending:
+    #         task.cancel()
+    #         # Now we should await task to execute it's cancellation.
+    #         # Cancelled task raises asyncio.CancelledError that we can suppress:
+    #         with suppress(asyncio.CancelledError):
+    #             loop.run_until_complete(task)
 
     async def run(self):
-        self.stop_event = Event_ts()
+        #self.stop_event = Event_ts()
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.socket.bind(('localhost', 9999))
         print('Listening...')
@@ -254,7 +254,7 @@ class Server:
 
         loop = asyncio.get_event_loop()
 
-        loop.create_task(self.wait_for_stop())
+        # loop.create_task(self.wait_for_stop())
 
         while True:
             print('Waiting for client...')
